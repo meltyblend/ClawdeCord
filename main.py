@@ -1,5 +1,6 @@
 import os
 
+import anthropic
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -14,6 +15,38 @@ CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 # Create the bot. `!` is the prefix for text commands (e.g. !ping),
 # and Intents.all() subscribes to every gateway event Discord offers.
 bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
+
+# Async Anthropic client — reads ANTHROPIC_API_KEY from the environment.
+# Async so calls don't block discord.py's event loop.
+claude = anthropic.AsyncAnthropic()
+
+CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_SYSTEM_PROMPT = (
+    "You are Clawde, a helpful assistant living in a Discord channel. "
+    "Keep replies concise and chat-appropriate (under ~500 characters when possible). "
+    "You can use both plain text and Discord appropriate Markdown. "
+    "Italics, Bold, Underline, Headers, Code Blocks, Multi-line Code Blocks, and Block Quotes."
+)
+CLAUDE_MAX_TOKENS = 512
+
+# Discord caps individual messages at 2000 characters.
+DISCORD_MESSAGE_LIMIT = 2000
+
+
+async def ask_claude(question: str) -> str:
+    """Send the user's question to Claude and return the text reply."""
+    response = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=CLAUDE_MAX_TOKENS,
+        system=CLAUDE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": question}],
+    )
+    return next((b.text for b in response.content if b.type == "text"), "")
+
+
+def chunk_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
+    """Split a long reply into <=limit-char chunks so Discord will accept it."""
+    return [text[i : i + limit] for i in range(0, len(text), limit)] or [""]
 
 
 @bot.event
@@ -33,9 +66,30 @@ async def on_message(message):
     # Ignore the bot's own messages to avoid replying to itself in a loop.
     if message.author == bot.user:
         return
-    # If the bot was @-mentioned in the message, send a reply.
+
+    # If the bot was @-mentioned, treat the rest of the message as a question for Claude.
     if bot.user in message.mentions:
-        await message.channel.send("Hi Aren")
+        # Strip the <@bot_id> mention token(s) out to get the actual question text.
+        question = message.content
+        for mention in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
+            question = question.replace(mention, "")
+        question = question.strip()
+
+        if not question:
+            await message.reply("Ask me something after the mention and I'll answer.")
+        else:
+            # Show the typing indicator while Claude is generating a response.
+            async with message.channel.typing():
+                try:
+                    answer = await ask_claude(question)
+                except anthropic.APIError as e:
+                    await message.reply(f"Sorry, I hit an API error: {e.message}")
+                    return
+
+            # Send the reply, splitting if it exceeds Discord's per-message char limit.
+            for chunk in chunk_for_discord(answer or "(empty response)"):
+                await message.reply(chunk)
+
     # Hand the message off to the commands extension so `!`-prefixed
     # commands still get dispatched (overriding on_message disables this by default).
     await bot.process_commands(message)
