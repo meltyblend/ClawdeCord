@@ -1,6 +1,7 @@
 import os
 
 import discord
+from discord.ext import commands
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -8,13 +9,15 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
 
-intents = discord.Intents.default()
-client = discord.Client(intents=intents)
+bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 
 
-@client.event
+@bot.event
 async def on_ready():
-    print(f"Logged in as {client.user}")
+    print(f"Logged in as {bot.user}")
+    print("Clawde is ready!")
+    channel = bot.get_channel(CHANNEL_ID)
+    await channel.send("Hello, I am ClawdeCord")
 
 
-client.run(BOT_TOKEN)
+bot.run(BOT_TOKEN)
