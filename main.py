@@ -20,4 +20,13 @@ async def on_ready():
     await channel.send("Hello, I am ClawdeCord")
 
 
+@bot.event
+async def on_message(message):
+    if message.author == bot.user:
+        return
+    if bot.user in message.mentions:
+        await message.channel.send("Hi Aren")
+    await bot.process_commands(message)
+
+
 bot.run(BOT_TOKEN)
