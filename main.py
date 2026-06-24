@@ -1,4 +1,6 @@
 import os
+from datetime import datetime, time, timezone
+from zoneinfo import ZoneInfo
 
 import anthropic
 import discord
@@ -25,21 +27,67 @@ CLAUDE_SYSTEM_PROMPT = (
     "You are Clawde, a helpful assistant living in a Discord channel. "
     "Keep replies concise and chat-appropriate (under ~500 characters when possible). "
     "You can use both plain text and Discord appropriate Markdown. "
-    "Italics, Bold, Underline, Headers, Code Blocks, Multi-line Code Blocks, and Block Quotes."
+    "Italics, Bold, Underline, Headers, Code Blocks, Multi-line Code Blocks, and Block Quotes. "
+    "Each user message includes today's prior conversation in the channel as context — "
+    "use it when relevant (e.g. summarizing, following up), but don't rehash it unprompted."
 )
 CLAUDE_MAX_TOKENS = 512
 
 # Discord caps individual messages at 2000 characters.
 DISCORD_MESSAGE_LIMIT = 2000
 
+# Daily-context settings: the conversation log handed to Claude resets at
+# local midnight in this timezone, and is capped at this many messages.
+LOCAL_TZ = ZoneInfo("America/Los_Angeles")
+HISTORY_MESSAGE_CAP = 500
 
-async def ask_claude(question: str) -> str:
-    """Send the user's question to Claude and return the text reply."""
+
+def start_of_today_utc() -> datetime:
+    """Return the UTC datetime corresponding to today's midnight in LOCAL_TZ."""
+    now_local = datetime.now(LOCAL_TZ)
+    start_local = datetime.combine(now_local.date(), time.min, tzinfo=LOCAL_TZ)
+    return start_local.astimezone(timezone.utc)
+
+
+async def fetch_today_transcript(channel, before_message) -> str:
+    """Pull up to HISTORY_MESSAGE_CAP messages from `channel` posted today
+    (LOCAL_TZ) and before `before_message`, formatted as a chat transcript."""
+    start = start_of_today_utc()
+    # Newest-first + cap means we keep the *recent* tail if the day is huge.
+    recent = [
+        msg
+        async for msg in channel.history(
+            after=start, before=before_message, limit=HISTORY_MESSAGE_CAP, oldest_first=False
+        )
+    ]
+    recent.reverse()  # transcript reads top-down chronologically
+
+    lines = []
+    for msg in recent:
+        if not msg.content:
+            continue  # skip embed-only / attachment-only messages
+        local_time = msg.created_at.astimezone(LOCAL_TZ).strftime("%-I:%M %p")
+        lines.append(f"[{local_time}] {msg.author.display_name}: {msg.content}")
+    return "\n".join(lines)
+
+
+async def ask_claude(question: str, asker: str, transcript: str) -> str:
+    """Send the user's question + today's channel transcript to Claude."""
+    if transcript:
+        user_content = (
+            "Today's conversation in this Discord channel so far:\n\n"
+            f"{transcript}\n\n"
+            "---\n"
+            f"{asker} just asked: {question}"
+        )
+    else:
+        user_content = f"{asker} asks: {question}"
+
     response = await claude.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
         system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": question}],
+        messages=[{"role": "user", "content": user_content}],
     )
     return next((b.text for b in response.content if b.type == "text"), "")
 
@@ -81,7 +129,8 @@ async def on_message(message):
             # Show the typing indicator while Claude is generating a response.
             async with message.channel.typing():
                 try:
-                    answer = await ask_claude(question)
+                    transcript = await fetch_today_transcript(message.channel, message)
+                    answer = await ask_claude(question, message.author.display_name, transcript)
                 except anthropic.APIError as e:
                     await message.reply(f"Sorry, I hit an API error: {e.message}")
                     return
