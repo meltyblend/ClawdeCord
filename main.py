@@ -1,4 +1,6 @@
+import io
 import os
+import re
 from datetime import datetime, time, timezone
 from zoneinfo import ZoneInfo
 
@@ -13,6 +15,7 @@ load_dotenv()
 # Secrets/config pulled from .env so they aren't hardcoded in source
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = int(os.getenv("CHANNEL_ID"))
+CHANNEL_ID2 = int(os.getenv("CHANNEL_ID2"))
 
 # Create the bot. `!` is the prefix for text commands (e.g. !ping),
 # and Intents.all() subscribes to every gateway event Discord offers.
@@ -28,6 +31,9 @@ CLAUDE_SYSTEM_PROMPT = (
     "Keep replies concise and chat-appropriate (under ~500 characters when possible). "
     "You can use both plain text and Discord appropriate Markdown. "
     "Italics, Bold, Underline, Headers, Code Blocks, Multi-line Code Blocks, and Block Quotes. "
+    "When asked for a file or script, put the code in a single fenced code block tagged with "
+    "the correct file extension as the language identifier (e.g. ```py, ```js, ```sh) so it can "
+    "be saved directly as a file. "
     "Each user message includes today's prior conversation in the channel as context — "
     "use it when relevant (e.g. summarizing, following up), but don't rehash it unprompted."
 )
@@ -97,13 +103,39 @@ def chunk_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str
     return [text[i : i + limit] for i in range(0, len(text), limit)] or [""]
 
 
+# Phrases that signal the user wants an actual file/script, not just an inline snippet.
+FILE_REQUEST_KEYWORDS = ("file", "script", "code for", "write me", "program")
+
+# Only allow short, plain-alphanumeric tags as extensions (no path traversal, no junk).
+CODE_BLOCK_PATTERN = re.compile(r"```([a-zA-Z0-9]{1,10})?\n(.*?)```", re.DOTALL)
+
+
+def wants_file(question: str) -> bool:
+    """Heuristic: did the user explicitly ask for a file/script rather than a snippet?"""
+    lowered = question.lower()
+    return any(keyword in lowered for keyword in FILE_REQUEST_KEYWORDS)
+
+
+def extract_code_block(answer: str) -> tuple[str, str] | None:
+    """Pull the first fenced code block out of Claude's reply, if any.
+    Trusts the block's own language tag (Claude is instructed via
+    CLAUDE_SYSTEM_PROMPT to tag it with the correct file extension) so new
+    languages don't require code changes here."""
+    match = CODE_BLOCK_PATTERN.search(answer)
+    if not match:
+        return None
+    language, code = match.group(1), match.group(2)
+    extension = (language or "txt").lower()
+    return f"snippet.{extension}", code.strip()
+
+
 @bot.event
 async def on_ready():
     # Fires once the bot has connected and authenticated with Discord.
     print(f"Logged in as {bot.user}")
     print("Clawde is ready!")
     # Look up the target channel by ID and post a startup greeting.
-    channel = bot.get_channel(CHANNEL_ID)
+    channel = bot.get_channel(CHANNEL_ID2)
     await channel.send("Hello, I am ClawdeCord")
 
 
@@ -124,7 +156,7 @@ async def on_message(message):
         question = question.strip()
 
         if not question:
-            await message.reply("Ask me something after the mention and I'll answer.")
+            await message.reply("Ask me or say something after the mention and I'll respond!")
         else:
             # Show the typing indicator while Claude is generating a response.
             async with message.channel.typing():
@@ -135,9 +167,20 @@ async def on_message(message):
                     await message.reply(f"Sorry, I hit an API error: {e.message}")
                     return
 
-            # Send the reply, splitting if it exceeds Discord's per-message char limit.
-            for chunk in chunk_for_discord(answer or "(empty response)"):
-                await message.reply(chunk)
+            extracted = extract_code_block(answer) if wants_file(question) else None
+            if extracted:
+                # User asked for a file/script: send the code as an attachment
+                # (named per the code block's own language tag) instead of inline text.
+                filename, code = extracted
+                caption = CODE_BLOCK_PATTERN.sub("", answer).strip() or "Here's your file:"
+                file_buffer = io.BytesIO(code.encode("utf-8"))
+                for chunk in chunk_for_discord(caption):
+                    await message.reply(chunk)
+                await message.reply(file=discord.File(file_buffer, filename=filename))
+            else:
+                # Send the reply, splitting if it exceeds Discord's per-message char limit.
+                for chunk in chunk_for_discord(answer or "(empty response)"):
+                    await message.reply(chunk)
 
     # Hand the message off to the commands extension so `!`-prefixed
     # commands still get dispatched (overriding on_message disables this by default).
