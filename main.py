@@ -1,3 +1,4 @@
+import base64
 import io
 import os
 import re
@@ -39,6 +40,11 @@ CLAUDE_SYSTEM_PROMPT = (
 )
 CLAUDE_MAX_TOKENS = 512
 
+# Image types Claude's vision API accepts.
+SUPPORTED_IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
+# Anthropic's per-image size cap.
+MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
 # Discord caps individual messages at 2000 characters.
 DISCORD_MESSAGE_LIMIT = 2000
 
@@ -77,8 +83,30 @@ async def fetch_today_transcript(channel, before_message) -> str:
     return "\n".join(lines)
 
 
-async def ask_claude(question: str, asker: str, transcript: str) -> str:
-    """Send the user's question + today's channel transcript to Claude."""
+async def download_image_attachments(message: discord.Message) -> list[dict]:
+    """Download any supported image attachments on `message` as Claude image content blocks."""
+    blocks = []
+    for attachment in message.attachments:
+        if attachment.content_type not in SUPPORTED_IMAGE_TYPES:
+            continue
+        if attachment.size > MAX_IMAGE_BYTES:
+            continue
+        data = await attachment.read()
+        blocks.append(
+            {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": attachment.content_type,
+                    "data": base64.b64encode(data).decode("utf-8"),
+                },
+            }
+        )
+    return blocks
+
+
+async def ask_claude(question: str, asker: str, transcript: str, images: list[dict] | None = None) -> str:
+    """Send the user's question (plus any attached images) + today's channel transcript to Claude."""
     if transcript:
         user_content = (
             "Today's conversation in this Discord channel so far:\n\n"
@@ -89,11 +117,13 @@ async def ask_claude(question: str, asker: str, transcript: str) -> str:
     else:
         user_content = f"{asker} asks: {question}"
 
+    content = [*images, {"type": "text", "text": user_content}] if images else user_content
+
     response = await claude.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
         system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": user_content}],
+        messages=[{"role": "user", "content": content}],
     )
     return next((b.text for b in response.content if b.type == "text"), "")
 
@@ -154,15 +184,18 @@ async def on_message(message):
         for mention in (f"<@{bot.user.id}>", f"<@!{bot.user.id}>"):
             question = question.replace(mention, "")
         question = question.strip()
+        images = await download_image_attachments(message)
 
-        if not question:
+        if not question and not images:
             await message.reply("Ask me or say something after the mention and I'll respond!")
         else:
+            # Default prompt when someone mentions the bot with just an image and no text.
+            question = question or "What do you see in this image?"
             # Show the typing indicator while Claude is generating a response.
             async with message.channel.typing():
                 try:
                     transcript = await fetch_today_transcript(message.channel, message)
-                    answer = await ask_claude(question, message.author.display_name, transcript)
+                    answer = await ask_claude(question, message.author.display_name, transcript, images)
                 except anthropic.APIError as e:
                     await message.reply(f"Sorry, I hit an API error: {e.message}")
                     return
