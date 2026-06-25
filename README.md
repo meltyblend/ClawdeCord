@@ -5,7 +5,7 @@ Claude. It reads the day's prior messages in the channel so it can follow up,
 summarize, and stay on topic. Run it on your own server with your own keys.
 
 - Replies to any message that `@mentions` the bot, in any channel it can see.
-- Feeds Claude today's conversation (resets at local midnight) as context.
+- Feeds Claude today's conversation (resets at local midnight PST Los Angeles) as context.
 - Splits long answers across messages without breaking code blocks.
 - Optional one-time startup greeting in a channel of your choice.
 
