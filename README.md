@@ -5,7 +5,7 @@ Claude. It reads the day's prior messages in the channel so it can follow up,
 summarize, and stay on topic. Run it on your own server with your own keys.
 
 - Replies to any message that `@mentions` the bot, in any channel it can see.
-- Feeds Claude today's conversation (resets at local midnight) as context.
+- Feeds Claude today's conversation (resets at local midnight PST Los Angeles) as context.
 - Splits long answers across messages without breaking code blocks.
 - Optional one-time startup greeting in a channel of your choice.
 
@@ -44,13 +44,21 @@ pip install -r requirements.txt
 
 1. Open the **OAuth2 → URL Generator** tab.
 2. Under **Scopes**, check **`bot`**.
-3. Under **Bot Permissions**, check:
-   - **View Channels**
+3. Under **Bot Permissions**>>**Text Permissions/General Permissions**, check:
    - **Send Messages**
+   - **Create Public Threads**
+   - **Send Messages in Threads**
+   - **Embed Links**
+   - **Attach Files**
    - **Read Message History** — required; without it the bot errors on every
      mention while trying to read the day's context.
-   - **Embed Links** (optional, nicer link previews)
-4. Copy the generated URL at the bottom, open it in your browser, and add the
+   - **Mention Everyone** - I allowed this just cause (personal preference)
+   - **Add Reactions**
+   - **Create Polls**
+   - **Bypass Slowmode** (Optional)
+   - **View Channels**
+   - **Change Nickname**
+5. Copy the generated URL at the bottom, open it in your browser, and add the
    bot to your server.
 
 ## 4. Get your Anthropic API key
@@ -81,7 +89,7 @@ exactly which one.
 ## 6. Run
 
 ```bash
-python bot.py
+python main.py
 ```
 
 You should see a log line like `Logged in as Clawde#1234`. Mention the bot in
