@@ -2,7 +2,7 @@ import base64
 import io
 import os
 import re
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import anthropic
@@ -75,6 +75,11 @@ DISCORD_MESSAGE_LIMIT = 2000
 LOCAL_TZ = ZoneInfo("America/Los_Angeles")
 HISTORY_MESSAGE_CAP = 500
 
+# If the channel has been silent for at least this long, the next message is
+# treated as a fresh start: the earlier backlog is dropped from Claude's context
+# so a stale (or toxic) conversation doesn't bleed into the new one. Tune freely.
+CONTEXT_RESET_GAP = timedelta(minutes=30)
+
 
 def start_of_today_utc() -> datetime:
     """Return the UTC datetime corresponding to today's midnight in LOCAL_TZ."""
@@ -83,11 +88,17 @@ def start_of_today_utc() -> datetime:
     return start_local.astimezone(timezone.utc)
 
 
-async def fetch_today_transcript(channel, before_message=None) -> str:
+async def fetch_today_transcript(channel, before_message=None, reset_on_gap=False) -> str:
     """Pull up to HISTORY_MESSAGE_CAP messages from `channel` posted today
     (LOCAL_TZ) and before `before_message`, formatted as a chat transcript.
     `before_message` defaults to None (up to now) so slash commands, which have
-    no triggering message, can call this too."""
+    no triggering message, can call this too.
+
+    When `reset_on_gap` is True, the transcript is scoped to the current
+    conversation "burst": if the channel went quiet for >= CONTEXT_RESET_GAP
+    before now, everything older than that silence is dropped (a fresh start).
+    Conversational paths (mentions, /ask) want this; /catchup, which summarizes
+    the whole day, leaves it off."""
     start = start_of_today_utc()
     # Newest-first + cap means we keep the *recent* tail if the day is huge.
     recent = [
@@ -97,6 +108,20 @@ async def fetch_today_transcript(channel, before_message=None) -> str:
         )
     ]
     recent.reverse()  # transcript reads top-down chronologically
+
+    if reset_on_gap and recent:
+        # If the channel has been silent since the last message, start fresh —
+        # the prior conversation is over, don't carry its vibe into this one.
+        reference_time = before_message.created_at if before_message else datetime.now(timezone.utc)
+        if reference_time - recent[-1].created_at >= CONTEXT_RESET_GAP:
+            return ""
+        # Otherwise keep only the latest burst: drop everything before the most
+        # recent gap of >= CONTEXT_RESET_GAP between consecutive messages.
+        cut = 0
+        for i in range(1, len(recent)):
+            if recent[i].created_at - recent[i - 1].created_at >= CONTEXT_RESET_GAP:
+                cut = i
+        recent = recent[cut:]
 
     lines = []
     for msg in recent:
@@ -173,6 +198,14 @@ def chunk_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str
 # Phrases that signal the user wants an actual file/script, not just an inline snippet.
 FILE_REQUEST_KEYWORDS = ("file", "script", "code for", "write me", "program")
 
+# Phrases that signal the user wants a recap/summary of the channel. These need the
+# full day's history even after a silence gap, so we bypass the burst reset for them
+# (makes /catchup reachable by just @mentioning Clawde).
+RECAP_KEYWORDS = (
+    "summary", "summarize", "what has been going on", "recap", "catch me up", "catch up", "what did i miss",
+    "what'd i miss", "what did we miss", "tl;dr", "tldr", "rundown",
+)
+
 # Only allow short, plain-alphanumeric tags as extensions (no path traversal, no junk).
 CODE_BLOCK_PATTERN = re.compile(r"```([a-zA-Z0-9]{1,10})?\n(.*?)```", re.DOTALL)
 
@@ -181,6 +214,12 @@ def wants_file(question: str) -> bool:
     """Heuristic: did the user explicitly ask for a file/script rather than a snippet?"""
     lowered = question.lower()
     return any(keyword in lowered for keyword in FILE_REQUEST_KEYWORDS)
+
+
+def wants_recap(question: str) -> bool:
+    """Heuristic: is the user asking Clawde to summarize/recap the channel?"""
+    lowered = question.lower()
+    return any(keyword in lowered for keyword in RECAP_KEYWORDS)
 
 
 def extract_code_block(answer: str) -> tuple[str, str] | None:
@@ -238,7 +277,7 @@ async def ask_command(interaction: discord.Interaction, question: str, public: b
     # 3s window Discord gives us to acknowledge an interaction.
     await interaction.response.defer(thinking=True, ephemeral=ephemeral)
     try:
-        transcript = await fetch_today_transcript(interaction.channel)
+        transcript = await fetch_today_transcript(interaction.channel, reset_on_gap=True)
         answer = await ask_claude(question, interaction.user.display_name, transcript)
     except anthropic.APIError as e:
         await interaction.followup.send(f"Sorry, I hit an API error: {e.message}", ephemeral=ephemeral)
@@ -337,7 +376,11 @@ async def on_message(message):
             # Show the typing indicator while Claude is generating a response.
             async with message.channel.typing():
                 try:
-                    transcript = await fetch_today_transcript(message.channel, message)
+                    # A recap request needs the full day even after a silence gap;
+                    # everything else stays scoped to the current conversation burst.
+                    transcript = await fetch_today_transcript(
+                        message.channel, message, reset_on_gap=not wants_recap(question)
+                    )
                     answer = await ask_claude(question, message.author.display_name, transcript, images)
                 except anthropic.APIError as e:
                     await message.reply(f"Sorry, I hit an API error: {e.message}")
