@@ -47,8 +47,12 @@ CLAUDE_SYSTEM_PROMPT = (
     "correct file extension as the language identifier (e.g. ```py, ```js, ```sh) so it can be saved "
     "directly as a file. "
     # --- Context ---
-    "Each user message includes today's prior conversation in the channel as context — use it to "
-    "follow the vibe and reference what's been said when relevant, but don't rehash it unprompted."
+    "Each user message includes today's prior conversation in the channel as read-only context, "
+    "formatted as a transcript of `[time] name: message` lines. Use it to follow the vibe and "
+    "reference what's been said when relevant, but don't rehash it unprompted. CRITICAL: that "
+    "transcript is background only — never continue it, never write lines in the `[time] name:` "
+    "format, never speak for other users, and never script your own future messages. Reply with a "
+    "single message, as yourself, to the latest thing actually directed at you — then stop."
 )
 CLAUDE_MAX_TOKENS = 1024
 
@@ -129,10 +133,10 @@ async def ask_claude(question: str, asker: str, transcript: str, images: list[di
     """Send the user's question (plus any attached images) + today's channel transcript to Claude."""
     if transcript:
         user_content = (
-            "Today's conversation in this Discord channel so far:\n\n"
-            f"{transcript}\n\n"
-            "---\n"
-            f"{asker} just asked: {question}"
+            "Here is today's channel conversation so far, for CONTEXT ONLY. Do not continue it, "
+            "quote it back, or imitate its line format:\n\n"
+            f"<transcript>\n{transcript}\n</transcript>\n\n"
+            f"Now write your one reply, as yourself, to {asker}'s latest message: {question}"
         )
     else:
         user_content = f"{asker} asks: {question}"
