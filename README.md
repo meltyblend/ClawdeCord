@@ -44,13 +44,21 @@ pip install -r requirements.txt
 
 1. Open the **OAuth2 → URL Generator** tab.
 2. Under **Scopes**, check **`bot`**.
-3. Under **Bot Permissions**, check:
-   - **View Channels**
+3. Under **Bot Permissions**>>**Text Permissions/General Permissions**, check:
    - **Send Messages**
+   - **Create Public Threads**
+   - **Send Messages in Threads**
+   - **Embed Links**
+   - **Attach Files**
    - **Read Message History** — required; without it the bot errors on every
      mention while trying to read the day's context.
-   - **Embed Links** (optional, nicer link previews)
-4. Copy the generated URL at the bottom, open it in your browser, and add the
+   - **Mention Everyone** - I allowed this just cause (personal preference)
+   - **Add Reactions**
+   - **Create Polls**
+   - **Bypass Slowmode** (Optional)
+   - **View Channels**
+   - **Change Nickname**
+5. Copy the generated URL at the bottom, open it in your browser, and add the
    bot to your server.
 
 ## 4. Get your Anthropic API key
