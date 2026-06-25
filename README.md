@@ -89,7 +89,7 @@ exactly which one.
 ## 6. Run
 
 ```bash
-python bot.py
+python main.py
 ```
 
 You should see a log line like `Logged in as Clawde#1234`. Mention the bot in
