@@ -7,6 +7,7 @@ from zoneinfo import ZoneInfo
 
 import anthropic
 import discord
+from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
 
@@ -49,7 +50,13 @@ CLAUDE_SYSTEM_PROMPT = (
     "Each user message includes today's prior conversation in the channel as context — use it to "
     "follow the vibe and reference what's been said when relevant, but don't rehash it unprompted."
 )
-CLAUDE_MAX_TOKENS = 512
+CLAUDE_MAX_TOKENS = 1024
+
+# Server-side web search. Claude decides when to search, runs the queries on
+# Anthropic's infra, and grounds its reply in the results — no separate search
+# API needed. Haiku 4.5 uses the basic variant (the _20260209 dynamic-filtering
+# variant requires Opus/Sonnet 4.6+).
+WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 5}
 
 # Image types Claude's vision API accepts.
 SUPPORTED_IMAGE_TYPES = ("image/png", "image/jpeg", "image/gif", "image/webp")
@@ -72,9 +79,11 @@ def start_of_today_utc() -> datetime:
     return start_local.astimezone(timezone.utc)
 
 
-async def fetch_today_transcript(channel, before_message) -> str:
+async def fetch_today_transcript(channel, before_message=None) -> str:
     """Pull up to HISTORY_MESSAGE_CAP messages from `channel` posted today
-    (LOCAL_TZ) and before `before_message`, formatted as a chat transcript."""
+    (LOCAL_TZ) and before `before_message`, formatted as a chat transcript.
+    `before_message` defaults to None (up to now) so slash commands, which have
+    no triggering message, can call this too."""
     start = start_of_today_utc()
     # Newest-first + cap means we keep the *recent* tail if the day is huge.
     recent = [
@@ -130,14 +139,26 @@ async def ask_claude(question: str, asker: str, transcript: str, images: list[di
 
     content = [*images, {"type": "text", "text": user_content}] if images else user_content
 
-    response = await claude.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=CLAUDE_MAX_TOKENS,
-        temperature=1.0,
-        system=CLAUDE_SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": content}],
-    )
-    return next((b.text for b in response.content if b.type == "text"), "")
+    messages = [{"role": "user", "content": content}]
+    # Web search runs a server-side tool loop. Usually it finishes in one call,
+    # but if it hits the loop cap it returns stop_reason "pause_turn" and we
+    # re-send to let it continue. Cap our own retries so we can't spin forever.
+    for _ in range(3):
+        response = await claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=CLAUDE_MAX_TOKENS,
+            temperature=1.0,
+            system=CLAUDE_SYSTEM_PROMPT,
+            tools=[WEB_SEARCH_TOOL],
+            messages=messages,
+        )
+        if response.stop_reason != "pause_turn":
+            break
+        messages.append({"role": "assistant", "content": response.content})
+
+    # With web search the reply can hold several text blocks (Claude narrates,
+    # searches, then answers), so join them all rather than taking the first.
+    return "".join(b.text for b in response.content if b.type == "text").strip()
 
 
 def chunk_for_discord(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> list[str]:
@@ -171,10 +192,116 @@ def extract_code_block(answer: str) -> tuple[str, str] | None:
     return f"snippet.{extension}", code.strip()
 
 
+async def summarize_transcript(transcript: str, requester: str) -> str:
+    """Ask Claude for a quick TL;DR of a channel transcript (the /catchup command)."""
+    user_content = (
+        "Here's the recent conversation in this Discord channel:\n\n"
+        f"{transcript}\n\n"
+        "---\n"
+        f"{requester} just asked you to catch them up on what they missed. Give a quick, "
+        "casual TL;DR — the main topics, decisions, or drama as a few short bullet points. "
+        "Skip the trivial back-and-forth. If barely anything happened, just say so."
+    )
+    response = await claude.messages.create(
+        model=CLAUDE_MODEL,
+        max_tokens=CLAUDE_MAX_TOKENS,
+        temperature=1.0,
+        system=CLAUDE_SYSTEM_PROMPT,
+        messages=[{"role": "user", "content": user_content}],
+    )
+    return "".join(b.text for b in response.content if b.type == "text").strip()
+
+
+async def send_interaction_reply(interaction: discord.Interaction, text: str, ephemeral: bool = False) -> None:
+    """Send a (possibly long) reply to a slash command, splitting to Discord's char limit.
+    Assumes the interaction has already been deferred. `ephemeral` should match the
+    defer's visibility so the chunks land the same way (private vs. public)."""
+    for chunk in chunk_for_discord(text or "(empty response)"):
+        await interaction.followup.send(chunk, ephemeral=ephemeral)
+
+
+@bot.tree.command(name="ask", description="Ask Clawde anything — it'll search the web if needed.")
+@app_commands.describe(
+    question="What do you want to ask?",
+    public="Show the answer to everyone in the channel? (default: only you)",
+)
+async def ask_command(interaction: discord.Interaction, question: str, public: bool = False):
+    # Private (ephemeral) by default so quick lookups don't clutter the channel;
+    # pass public:true to post the answer for everyone. The defer's visibility
+    # carries to every followup, so we thread `ephemeral` through them all.
+    ephemeral = not public
+    # Defer immediately: Claude (plus any web search) can take longer than the
+    # 3s window Discord gives us to acknowledge an interaction.
+    await interaction.response.defer(thinking=True, ephemeral=ephemeral)
+    try:
+        transcript = await fetch_today_transcript(interaction.channel)
+        answer = await ask_claude(question, interaction.user.display_name, transcript)
+    except anthropic.APIError as e:
+        await interaction.followup.send(f"Sorry, I hit an API error: {e.message}", ephemeral=ephemeral)
+        return
+    await send_interaction_reply(interaction, answer, ephemeral=ephemeral)
+
+
+@bot.tree.command(name="catchup", description="Get a TL;DR of what you missed in this channel today.")
+async def catchup_command(interaction: discord.Interaction):
+    await interaction.response.defer(thinking=True)
+    try:
+        transcript = await fetch_today_transcript(interaction.channel)
+        if not transcript:
+            await interaction.followup.send("nothing's really happened in here today 👀")
+            return
+        summary = await summarize_transcript(transcript, interaction.user.display_name)
+    except anthropic.APIError as e:
+        await interaction.followup.send(f"Sorry, I hit an API error: {e.message}")
+        return
+    await send_interaction_reply(interaction, summary)
+
+
+@bot.tree.command(name="help", description="See what Clawde can do.")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="👋 hey, I'm Clawde",
+        description="Just a regular member of the server who happens to know things. Here's how to reach me:",
+        color=discord.Color.orange(),
+    )
+    embed.add_field(
+        name="@mention me",
+        value="Ping me with a question or just to chat. Attach an image and I'll take a look "
+        "(builds, screenshots, error screens, whatever). Ask for a file or script and I'll send it as an attachment.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/ask <question>",
+        value="Ask me privately from the slash menu — only you see the answer, so it won't clutter chat. "
+        "I'll search the web if the question needs current info. Add `public: true` to share the answer with the channel.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/catchup",
+        value="A quick TL;DR of what you missed in this channel today.",
+        inline=False,
+    )
+    embed.add_field(
+        name="/help",
+        value="This message.",
+        inline=False,
+    )
+    # Ephemeral: only the person who ran /help sees it, so it doesn't clutter chat.
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     # Fires once the bot has connected and authenticated with Discord.
     print(f"Logged in as {bot.user}")
+    # Register slash commands with Discord. Global sync can take up to an hour
+    # to propagate the first time; swap to bot.tree.sync(guild=...) for instant
+    # updates while testing in a single server.
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} slash command(s)")
+    except Exception as e:
+        print(f"Slash command sync failed: {e}")
     print("Clawde is ready!")
     # Look up the target channel by ID and post a startup greeting.
     channel = bot.get_channel(CHANNEL_ID2)
