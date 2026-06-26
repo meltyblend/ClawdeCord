@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=discord.Intents.all())
 # Async so calls don't block discord.py's event loop.
 claude = anthropic.AsyncAnthropic()
 
-CLAUDE_MODEL = "claude-haiku-4-5"
+CLAUDE_MODEL = "claude-sonnet-4-6"
 CLAUDE_SYSTEM_PROMPT = (
     # --- Who the bot is ---
     "You're Clawde, a regular member of this Discord server, not a corporate assistant. "
